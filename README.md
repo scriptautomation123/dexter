@@ -92,6 +92,11 @@ Or with watch mode for development:
 bun dev
 ```
 
+## Documentation
+
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** - Comprehensive architecture documentation with detailed explanations of how Dexter works internally
+- **[QUICK_REFERENCE.md](./QUICK_REFERENCE.md)** - Quick reference guide for developers with code examples and common tasks
+
 ## How to Contribute
 
 1. Fork the repository
