@@ -94,9 +94,17 @@ bun dev
 
 ## Documentation
 
-- **[ARCHITECTURE.md](./ARCHITECTURE.md)** - Comprehensive architecture documentation explaining how Dexter works internally
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** - Comprehensive architecture documentation explaining how Dexter works internally, including how it decides when to continue vs complete
 - **[CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md)** - Step-by-step walkthrough of a real query execution with annotated code
 - **[QUICK_REFERENCE.md](./QUICK_REFERENCE.md)** - Quick reference guide for developers with code examples and common tasks
+
+### Key Concept: Loop Completion Logic
+
+Want to understand how Dexter knows when to stop iterating? See the [Loop Completion Logic section in ARCHITECTURE.md](./ARCHITECTURE.md#how-dexter-decides-when-to-stop-loop-completion-logic) which explains:
+- How Dexter determines when further LLM prompting is required
+- How it knows when the answer is ready
+- The role of tool calls in decision-making
+- Prompt engineering techniques that guide completion
 
 ## How to Contribute
 

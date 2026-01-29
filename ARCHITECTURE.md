@@ -5,11 +5,12 @@
 2. [High-Level Architecture](#high-level-architecture)
 3. [Core Components](#core-components)
 4. [Agent Loop Execution Flow](#agent-loop-execution-flow)
-5. [Key Code Sections Explained](#key-code-sections-explained)
-6. [Data Flow](#data-flow)
-7. [Tool System](#tool-system)
-8. [Multi-Turn Conversations](#multi-turn-conversations)
-9. [UI Components](#ui-components)
+5. [How Dexter Decides When to Stop: Loop Completion Logic](#how-dexter-decides-when-to-stop-loop-completion-logic)
+6. [Key Code Sections Explained](#key-code-sections-explained)
+7. [Data Flow](#data-flow)
+8. [Tool System](#tool-system)
+9. [Multi-Turn Conversations](#multi-turn-conversations)
+10. [UI Components](#ui-components)
 
 ## Overview
 
@@ -564,6 +565,308 @@ UI displays complete answer
 │  Display Final Answer    │
 └──────────────────────────┘
 ```
+
+## How Dexter Decides When to Stop: Loop Completion Logic
+
+One of the most important aspects of Dexter's autonomous behavior is **how it determines when to continue iterating vs when the answer is ready**. This section explains the decision-making process in detail.
+
+### The Key Decision Point: Tool Calls
+
+Dexter's loop completion is based on a simple but powerful signal: **the presence or absence of tool calls in the LLM response**.
+
+```typescript
+// From src/agent/agent.ts
+while (iteration < this.maxIterations) {
+  iteration++;
+
+  const response = await this.callModel(currentPrompt);
+  const responseText = extractTextContent(response);
+
+  // 🔑 KEY DECISION: Check if LLM wants to use tools
+  if (!hasToolCalls(response)) {
+    // No tool calls = Answer is ready!
+    // Generate and stream final answer
+    const answerGenerator = this.generateFinalAnswer(query, scratchpad);
+    // ... stream answer and return
+    return;
+  }
+
+  // Has tool calls = Need more data
+  // Execute tools and continue to next iteration
+  await this.executeToolCalls(response, query, scratchpad);
+  currentPrompt = buildIterationPrompt(query, scratchpad.getToolSummaries());
+}
+```
+
+### The Three Completion Scenarios
+
+Dexter completes the loop in three scenarios:
+
+#### 1. Direct Response (No Tools Needed)
+
+When the query doesn't require external data, the LLM responds directly without tool calls.
+
+**Example:**
+- **User:** "What's your name?"
+- **LLM Response:** 
+  - Content: "I'm Dexter, a CLI assistant for financial research."
+  - Tool Calls: `[]` (empty)
+- **Dexter Action:** Returns the direct response immediately
+
+```typescript
+// Code from src/agent/agent.ts
+if (!hasToolCalls(response)) {
+  // If no tools were called at all, just use the direct response
+  if (!scratchpad.hasToolResults() && responseText) {
+    yield { type: 'answer_start' };
+    yield { type: 'answer_chunk', text: responseText };
+    yield { type: 'done', answer: responseText, toolCalls: [], iterations: iteration };
+    return;
+  }
+}
+```
+
+#### 2. Data Gathered (Tools Used, Now Complete)
+
+The most common scenario: the LLM has gathered sufficient data through tool calls and is ready to answer.
+
+**Example:**
+- **Iteration 1:**
+  - **LLM Response:** 
+    - Content: "I need Apple's revenue data"
+    - Tool Calls: `[{ name: 'financial_search', args: { query: 'Apple revenue Q4 2024' } }]`
+  - **Dexter Action:** Execute tool, save to scratchpad, continue
+  
+- **Iteration 2:**
+  - **Current Prompt:** Query + "Data retrieved: Apple Q4 2024 revenue was $94.9B"
+  - **LLM Response:** 
+    - Content: "I have sufficient data to answer"
+    - Tool Calls: `[]` (empty - no more tools needed)
+  - **Dexter Action:** Load full context, generate final answer
+
+```typescript
+// The iteration prompt explicitly encourages completion
+export function buildIterationPrompt(
+  originalQuery: string,
+  toolSummaries: string[]
+): string {
+  return `Query: ${originalQuery}
+
+Data retrieved and work completed so far:
+${toolSummaries.join('\n')}
+
+Review the data above. If you have sufficient information to answer the query, respond directly WITHOUT calling any tools. Only call additional tools if there are specific data gaps that prevent you from answering.`;
+}
+```
+
+This prompt design is crucial - it explicitly:
+- Shows what data has been gathered
+- **Encourages the LLM to complete** if data is sufficient
+- Only requests additional tools if there are **specific gaps**
+
+#### 3. Max Iterations Reached
+
+A safety mechanism to prevent infinite loops.
+
+```typescript
+while (iteration < this.maxIterations) {
+  // ... agent loop
+}
+
+// If we exit the loop, generate answer with whatever data we have
+const answerGenerator = this.generateFinalAnswer(query, scratchpad);
+// ... stream answer
+
+yield {
+  type: 'done',
+  answer: fullAnswer || `Reached maximum iterations (${this.maxIterations}).`,
+  toolCalls: scratchpad.getToolCallRecords(),
+  iterations: iteration
+};
+```
+
+**Default:** `maxIterations = 10`
+
+This ensures Dexter always completes, even if the LLM keeps requesting more tools.
+
+### How the LLM Decides: Prompt Engineering
+
+The system uses several prompt engineering techniques to guide the LLM's decision:
+
+#### 1. System Prompt - Tool Usage Policy
+
+```typescript
+// From src/agent/prompts.ts
+export function buildSystemPrompt(model: string): string {
+  return `You are Dexter, a CLI assistant with access to research tools.
+
+## Tool Usage Policy
+
+- Only use tools when the query actually requires external data
+- If a query can be answered from general knowledge, respond directly without using tools
+- ALWAYS prefer financial_search over web_search for any financial data
+- Call financial_search ONCE with the full natural language query
+- Do NOT break up queries into multiple tool calls when one call can handle the request
+...`;
+}
+```
+
+**Key principles:**
+- Use tools only when necessary
+- Be efficient (don't over-fetch)
+- Answer directly when possible
+
+#### 2. Iteration Prompt - Explicit Completion Signal
+
+After each tool execution:
+
+```typescript
+export function buildIterationPrompt(
+  originalQuery: string,
+  toolSummaries: string[]
+): string {
+  return `Query: ${originalQuery}
+
+Data retrieved and work completed so far:
+${toolSummaries.join('\n')}
+
+Review the data above. If you have sufficient information to answer the query, respond directly WITHOUT calling any tools. Only call additional tools if there are specific data gaps that prevent you from answering.`;
+}
+```
+
+**This prompt is critical** because it:
+1. **Shows progress:** Summaries of all data gathered so far
+2. **Explicitly asks:** "Do you have enough information?"
+3. **Provides clear instruction:** Respond without tools if ready
+4. **Sets high bar for more tools:** Only if there are "specific data gaps"
+
+Without this prompt, the LLM might continue requesting tools unnecessarily.
+
+### Technical Implementation: hasToolCalls()
+
+The actual check is simple:
+
+```typescript
+// From src/utils/ai-message.ts
+export function hasToolCalls(message: AIMessage): boolean {
+  return Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+}
+```
+
+LangChain's LLM responses include a `tool_calls` array. When the LLM decides it doesn't need tools:
+- OpenAI: Returns empty `tool_calls` array
+- Anthropic: Returns empty `tool_calls` array
+- Google: Returns empty `tool_calls` array
+
+All providers use the same interface, making this check provider-agnostic.
+
+### Visual Decision Flow
+
+```
+┌─────────────────────────────────────────┐
+│   LLM receives prompt with:             │
+│   - Original query                      │
+│   - Tool summaries (if any)             │
+│   - Instructions to complete if ready   │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│   LLM decides:                          │
+│   "Do I have enough data to answer?"    │
+└────────┬───────────────────┬────────────┘
+         │                   │
+    Yes  │                   │  No
+         │                   │
+         ▼                   ▼
+┌──────────────────┐  ┌──────────────────┐
+│  Respond with:   │  │  Respond with:   │
+│  - Content only  │  │  - Thinking text │
+│  - No tool_calls │  │  - Tool calls    │
+└────────┬─────────┘  └────────┬─────────┘
+         │                     │
+         ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐
+│ hasToolCalls()   │  │ hasToolCalls()   │
+│ returns false    │  │ returns true     │
+└────────┬─────────┘  └────────┬─────────┘
+         │                     │
+         ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐
+│ Generate final   │  │ Execute tools    │
+│ answer and DONE  │  │ Continue to next │
+│                  │  │ iteration        │
+└──────────────────┘  └──────────────────┘
+```
+
+### Why This Works
+
+This design is elegant because:
+
+1. **LLM-Driven:** The LLM itself decides when it has enough data, not hardcoded rules
+2. **Explicit Guidance:** Prompts clearly communicate what's expected
+3. **Context Aware:** The LLM sees all gathered data before deciding
+4. **Efficient:** Stops as soon as sufficient data is available
+5. **Safe:** Max iterations prevent runaway execution
+6. **Simple:** Single boolean check (`hasToolCalls`) determines the action
+
+### Example: Multi-Step Research Query
+
+**Query:** "Compare Apple and Microsoft's revenue growth"
+
+**Iteration 1:**
+- Prompt: "Compare Apple and Microsoft's revenue growth"
+- LLM decides: Need financial data for both companies
+- Tool calls: `[{ name: 'financial_search', args: { query: 'Apple Microsoft revenue comparison' } }]`
+- Action: Execute tool → Continue
+
+**Iteration 2:**
+- Prompt: "Query: Compare... \n\nData: Retrieved revenue data for AAPL and MSFT..."
+- LLM decides: "I have both companies' data, I can compare now"
+- Tool calls: `[]` (empty)
+- Action: **Generate final answer with comparison**
+
+The LLM autonomously determined that two iterations were sufficient.
+
+### Debugging: Understanding Why Agent Continues/Stops
+
+To understand Dexter's decisions:
+
+1. **Check scratchpad files:** `.dexter/scratchpad/*.jsonl`
+   - See exactly what data was gathered
+   - See thinking messages from LLM
+
+2. **Enable debug panel:** Set `show={true}` in `src/cli.tsx`
+
+3. **Look for "thinking" events:** The LLM often explains its reasoning
+   - "I need to get..." → Will call tools
+   - "I have sufficient data..." → Will complete
+
+4. **Count iterations:** Final answer shows iteration count
+   - Low count (1-2): Efficient, had data quickly
+   - High count (5+): Multiple data gathering steps
+   - Max count (10): Hit safety limit
+
+### Summary
+
+**Question:** How does Dexter know when answer is ready?
+
+**Answer:** When the LLM responds **without requesting any tool calls**. This happens because:
+- The iteration prompt explicitly asks if data is sufficient
+- The prompt shows all gathered data summaries
+- The LLM evaluates and decides autonomously
+- A simple boolean check (`hasToolCalls()`) determines the action
+
+**Question:** How does it figure out further LLM prompting is required?
+
+**Answer:** When the LLM responds **with one or more tool calls**. This signals:
+- The LLM needs additional data to answer
+- Dexter executes the requested tools
+- Results are added to scratchpad
+- Next iteration includes these results in the prompt
+- Loop continues until LLM responds without tool calls
+
+This creates a natural, efficient research loop that stops as soon as the task is complete.
 
 ## Data Flow
 
