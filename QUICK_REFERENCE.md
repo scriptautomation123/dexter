@@ -42,6 +42,30 @@ bun dev
 4. Stream answer to UI
 ```
 
+### 🎯 How Dexter Decides to Continue vs Complete
+
+**Key Signal:** Presence/absence of tool calls in LLM response
+
+**Continues when:** LLM returns `tool_calls` array with items
+- Means: "I need more data to answer"
+- Action: Execute tools → Next iteration
+
+**Completes when:** LLM returns empty `tool_calls` array
+- Means: "I have sufficient data to answer"
+- Action: Generate final answer with full context
+
+**Prompts guide this decision:**
+```typescript
+// Iteration prompt explicitly encourages completion
+"Review the data above. If you have sufficient information to answer 
+the query, respond directly WITHOUT calling any tools. Only call 
+additional tools if there are specific data gaps."
+```
+
+**Safety:** Max iterations (default: 10) prevents infinite loops
+
+**See:** [ARCHITECTURE.md - Loop Completion Logic](#) for detailed explanation
+
 ## 🧩 Key Components
 
 ### Agent (`src/agent/agent.ts`)
