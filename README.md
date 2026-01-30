@@ -97,6 +97,7 @@ bun dev
 - **[ARCHITECTURE.md](./ARCHITECTURE.md)** - Comprehensive architecture documentation explaining how Dexter works internally, including how it decides when to continue vs complete
 - **[CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md)** - Step-by-step walkthrough of a real query execution with annotated code
 - **[QUICK_REFERENCE.md](./QUICK_REFERENCE.md)** - Quick reference guide for developers with code examples and common tasks
+- **[WITHOUT_LANGCHAIN.md](./WITHOUT_LANGCHAIN.md)** - Guide on how to rewrite Dexter without LangChain, with direct API implementations
 
 ### Key Concept: Loop Completion Logic
 
