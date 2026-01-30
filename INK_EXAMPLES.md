@@ -605,7 +605,7 @@ export function CLI() {
     resetNavigation();
     
     const result = await runQuery(query);
-  }, [exit, startSelection, isInSelectionFlow, workingState, runQuery]);
+  }, [exit, startSelection, isInSelectionFlow, workingState, runQuery, saveMessage, resetNavigation]);
   
   // Global keyboard shortcuts
   useInput((input, key) => {
