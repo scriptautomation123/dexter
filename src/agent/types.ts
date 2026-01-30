@@ -62,18 +62,24 @@ export interface ToolErrorEvent {
 }
 
 /**
+ * Tool call was blocked or warned due to retry limits
+ */
+export interface ToolLimitEvent {
+  type: 'tool_limit';
+  tool: string;
+  /** Warning message (tool allowed but approaching limit or similar query) */
+  warning?: string;
+  /** Block reason (tool not allowed) */
+  blockReason?: string;
+  /** Whether the tool call was blocked */
+  blocked: boolean;
+}
+
+/**
  * Final answer generation started
  */
 export interface AnswerStartEvent {
   type: 'answer_start';
-}
-
-/**
- * Chunk of the final answer
- */
-export interface AnswerChunkEvent {
-  type: 'answer_chunk';
-  text: string;
 }
 
 /**
@@ -94,6 +100,6 @@ export type AgentEvent =
   | ToolStartEvent
   | ToolEndEvent
   | ToolErrorEvent
+  | ToolLimitEvent
   | AnswerStartEvent
-  | AnswerChunkEvent
   | DoneEvent;

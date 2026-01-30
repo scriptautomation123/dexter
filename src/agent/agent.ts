@@ -1,14 +1,14 @@
 import { AIMessage } from '@langchain/core/messages';
 import { StructuredToolInterface } from '@langchain/core/tools';
 import { callLlm, getFastModel } from '../model/llm.js';
-import { Scratchpad } from './scratchpad.js';
+import { Scratchpad, type ToolContextWithSummary } from './scratchpad.js';
 import { getTools } from '../tools/registry.js';
-import { buildSystemPrompt, buildIterationPrompt, buildFinalAnswerPrompt, buildToolSummaryPrompt } from '../agent/prompts.js';
+import { buildSystemPrompt, buildIterationPrompt, buildFinalAnswerPrompt, buildToolSummaryPrompt, buildContextSelectionPrompt } from '../agent/prompts.js';
 import { extractTextContent, hasToolCalls } from '../utils/ai-message.js';
-import { streamLlmResponse } from '../utils/llm-stream.js';
 import { InMemoryChatHistory } from '../utils/in-memory-chat-history.js';
 import { getToolDescription } from '../utils/tool-description.js';
-import type { AgentConfig, AgentEvent, ToolStartEvent, ToolEndEvent, ToolErrorEvent, AnswerStartEvent, AnswerChunkEvent } from '../agent/types.js';
+import { estimateTokens, TOKEN_BUDGET } from '../utils/tokens.js';
+import type { AgentConfig, AgentEvent, ToolStartEvent, ToolEndEvent, ToolErrorEvent, ToolLimitEvent } from '../agent/types.js';
 
 
 const DEFAULT_MAX_ITERATIONS = 10;
@@ -71,7 +71,7 @@ export class Agent {
     while (iteration < this.maxIterations) {
       iteration++;
 
-      const response = await this.callModel(currentPrompt);
+      const response = await this.callModel(currentPrompt) as AIMessage;
       const responseText = extractTextContent(response);
 
       // Emit thinking if there are also tool calls
@@ -86,23 +86,21 @@ export class Agent {
         // This handles greetings, clarifying questions, etc.
         if (!scratchpad.hasToolResults() && responseText) {
           yield { type: 'answer_start' };
-          yield { type: 'answer_chunk', text: responseText };
           yield { type: 'done', answer: responseText, toolCalls: [], iterations: iteration };
           return;
         }
 
-        // Stream final answer with full context from scratchpad
-        const answerGenerator = this.generateFinalAnswer(query, scratchpad);
-        let fullAnswer = '';
+        // Generate final answer with full context from scratchpad
+        const fullContext = await this.buildFullContextForAnswer(query, scratchpad);
+        const finalPrompt = buildFinalAnswerPrompt(query, fullContext);
         
-        for await (const event of answerGenerator) {
-          yield event;
-          if (event.type === 'answer_chunk') {
-            fullAnswer += event.text;
-          }
-        }
-        
-        yield { type: 'done', answer: fullAnswer, toolCalls: scratchpad.getToolCallRecords(), iterations: iteration };
+        yield { type: 'answer_start' };
+        const finalResponse = await this.callModel(finalPrompt, false);
+        const answer = typeof finalResponse === 'string' 
+          ? finalResponse 
+          : extractTextContent(finalResponse);
+
+        yield { type: 'done', answer, toolCalls: scratchpad.getToolCallRecords(), iterations: iteration };
         return;
       }
 
@@ -117,38 +115,44 @@ export class Agent {
       }
       
       // Build iteration prompt from scratchpad (always has full accumulated history)
-      currentPrompt = buildIterationPrompt(query, scratchpad.getToolSummaries());
+      // Include tool usage status for graceful exit mechanism
+      currentPrompt = buildIterationPrompt(
+        query, 
+        scratchpad.getToolSummaries(),
+        scratchpad.formatToolUsageForPrompt()
+      );
     }
 
     // Max iterations reached - still generate proper final answer
-    const answerGenerator = this.generateFinalAnswer(query, scratchpad);
-    let fullAnswer = '';
+    const fullContext = await this.buildFullContextForAnswer(query, scratchpad);
+    const finalPrompt = buildFinalAnswerPrompt(query, fullContext);
     
-    for await (const event of answerGenerator) {
-      yield event;
-      if (event.type === 'answer_chunk') {
-        fullAnswer += event.text;
-      }
-    }
-    
+    yield { type: 'answer_start' };
+    const finalResponse = await this.callModel(finalPrompt, false);
+    const answer = typeof finalResponse === 'string' 
+      ? finalResponse 
+      : extractTextContent(finalResponse);
+
     yield {
       type: 'done',
-      answer: fullAnswer || `Reached maximum iterations (${this.maxIterations}).`,
+      answer: answer || `Reached maximum iterations (${this.maxIterations}).`,
       toolCalls: scratchpad.getToolCallRecords(),
       iterations: iteration
     };
   }
 
   /**
-   * Call the LLM with the current prompt
+   * Call the LLM with the current prompt.
+   * @param prompt - The prompt to send to the LLM
+   * @param useTools - Whether to bind tools (default: true). When false, returns string directly.
    */
-  private async callModel(prompt: string): Promise<AIMessage> {
+  private async callModel(prompt: string, useTools: boolean = true): Promise<AIMessage | string> {
     return await callLlm(prompt, {
       model: this.model,
       systemPrompt: this.systemPrompt,
-      tools: this.tools,
+      tools: useTools ? this.tools : undefined,
       signal: this.signal,
-    }) as AIMessage;
+    }) as AIMessage | string;
   }
 
   /**
@@ -173,16 +177,24 @@ export class Agent {
   }
 
   /**
-   * Execute all tool calls from an LLM response and add results to scratchpad
+   * Execute all tool calls from an LLM response and add results to scratchpad.
+   * Deduplicates skill calls - each skill can only be executed once per query.
+   * Includes graceful exit mechanism - checks tool limits before executing.
    */
   private async *executeToolCalls(
     response: AIMessage,
     query: string,
     scratchpad: Scratchpad
-  ): AsyncGenerator<ToolStartEvent | ToolEndEvent | ToolErrorEvent, void> {
+  ): AsyncGenerator<ToolStartEvent | ToolEndEvent | ToolErrorEvent | ToolLimitEvent, void> {
     for (const toolCall of response.tool_calls!) {
       const toolName = toolCall.name;
       const toolArgs = toolCall.args as Record<string, unknown>;
+
+      // Deduplicate skill calls - each skill can only run once per query
+      if (toolName === 'skill') {
+        const skillName = toolArgs.skill as string;
+        if (scratchpad.hasExecutedSkill(skillName)) continue;
+      }
 
       const generator = this.executeToolCall(toolName, toolArgs, query, scratchpad);
       let result = await generator.next();
@@ -197,13 +209,46 @@ export class Agent {
   /**
    * Execute a single tool call and add result to scratchpad.
    * Yields start/end/error events for UI updates.
+   * Includes graceful exit mechanism - checks tool limits before executing.
    */
   private async *executeToolCall(
     toolName: string,
     toolArgs: Record<string, unknown>,
     query: string,
     scratchpad: Scratchpad
-  ): AsyncGenerator<ToolStartEvent | ToolEndEvent | ToolErrorEvent, void> {
+  ): AsyncGenerator<ToolStartEvent | ToolEndEvent | ToolErrorEvent | ToolLimitEvent, void> {
+    // Extract query string from tool args for similarity detection
+    const toolQuery = this.extractQueryFromArgs(toolArgs);
+
+    // Check tool limits before executing (graceful exit mechanism)
+    const limitCheck = scratchpad.canCallTool(toolName, toolQuery);
+    
+    if (!limitCheck.allowed) {
+      // Tool is blocked - yield limit event and skip execution
+      yield { 
+        type: 'tool_limit', 
+        tool: toolName, 
+        blockReason: limitCheck.blockReason, 
+        blocked: true 
+      };
+      
+      // Add a note to scratchpad about the blocked call
+      const toolDescription = getToolDescription(toolName, toolArgs);
+      const blockSummary = `- ${toolDescription} [BLOCKED]: ${limitCheck.blockReason}`;
+      scratchpad.addToolResult(toolName, toolArgs, `Blocked: ${limitCheck.blockReason}`, blockSummary);
+      return;
+    }
+
+    // Yield warning if approaching limits or similar query detected
+    if (limitCheck.warning) {
+      yield { 
+        type: 'tool_limit', 
+        tool: toolName, 
+        warning: limitCheck.warning, 
+        blocked: false 
+      };
+    }
+
     yield { type: 'tool_start', tool: toolName, args: toolArgs };
 
     const startTime = Date.now();
@@ -220,6 +265,9 @@ export class Agent {
 
       yield { type: 'tool_end', tool: toolName, args: toolArgs, result, duration };
 
+      // Record the tool call for limit tracking
+      scratchpad.recordToolCall(toolName, toolQuery);
+
       // Generate LLM summary for context compaction
       const llmSummary = await this.summarizeToolResult(query, toolName, toolArgs, result);
 
@@ -229,11 +277,30 @@ export class Agent {
       const errorMessage = error instanceof Error ? error.message : String(error);
       yield { type: 'tool_error', tool: toolName, error: errorMessage };
 
+      // Still record the call even on error (counts toward limit)
+      scratchpad.recordToolCall(toolName, toolQuery);
+
       // Add error to scratchpad
       const toolDescription = getToolDescription(toolName, toolArgs);
       const errorSummary = `- ${toolDescription} [FAILED]: ${errorMessage}`;
       scratchpad.addToolResult(toolName, toolArgs, `Error: ${errorMessage}`, errorSummary);
     }
+  }
+
+  /**
+   * Extract query string from tool arguments for similarity detection.
+   * Looks for common query-like argument names.
+   */
+  private extractQueryFromArgs(args: Record<string, unknown>): string | undefined {
+    const queryKeys = ['query', 'search', 'question', 'q', 'text', 'input'];
+    
+    for (const key of queryKeys) {
+      if (typeof args[key] === 'string') {
+        return args[key] as string;
+      }
+    }
+    
+    return undefined;
   }
 
   /**
@@ -257,56 +324,133 @@ export class Agent {
   }
 
   /**
-   * Generate the final answer by loading full context data and streaming the response.
-   */
-  private async *generateFinalAnswer(
-    query: string,
-    scratchpad: Scratchpad
-  ): AsyncGenerator<AnswerStartEvent | AnswerChunkEvent> {
-    yield { type: 'answer_start' };
-
-    // Get full context data from scratchpad
-    const fullContext = this.buildFullContextForAnswer(scratchpad);
-
-    // Build the final answer prompt
-    const prompt = buildFinalAnswerPrompt(query, fullContext);
-
-    // Stream the final answer using provider-agnostic streaming
-    const stream = streamLlmResponse(prompt, {
-      model: this.model,
-      systemPrompt: this.systemPrompt,
-    });
-
-    for await (const chunk of stream) {
-      yield { type: 'answer_chunk', text: chunk };
-    }
-  }
-
-  /**
    * Build full context data for final answer generation from scratchpad.
+   * Uses LLM-based selection when context exceeds token budget.
    */
-  private buildFullContextForAnswer(scratchpad: Scratchpad): string {
-    const contexts = scratchpad.getFullContexts();
+  private async buildFullContextForAnswer(query: string, scratchpad: Scratchpad): Promise<string> {
+    const contexts = scratchpad.getFullContextsWithSummaries();
 
     if (contexts.length === 0) {
       return 'No data was gathered.';
     }
 
-    // Filter out error results and format contexts for the prompt
+    // Filter out error results
     const validContexts = contexts.filter(ctx => !ctx.result.startsWith('Error:'));
 
     if (validContexts.length === 0) {
       return 'No data was successfully gathered.';
     }
 
-    return validContexts.map(ctx => {
-      const description = getToolDescription(ctx.toolName, ctx.args);
+    // Estimate total tokens for all full results
+    const totalTokens = validContexts.reduce(
+      (sum, ctx) => sum + estimateTokens(ctx.result), 0
+    );
+
+    // If within budget, use all full results (existing behavior)
+    if (totalTokens <= TOKEN_BUDGET) {
+      return this.formatFullContexts(validContexts);
+    }
+
+    // Over budget: use LLM to select most relevant results
+    try {
+      return await this.buildLLMSelectedContext(query, validContexts);
+    } catch {
+      // Fallback: use all summaries if LLM selection fails
+      return this.formatSummariesOnly(validContexts);
+    }
+  }
+
+  /**
+   * Use LLM to select which tool results need full data inclusion.
+   */
+  private async buildLLMSelectedContext(
+    query: string,
+    contexts: ToolContextWithSummary[]
+  ): Promise<string> {
+    // Prepare summaries with token costs for LLM
+    const summaries = contexts.map(ctx => ({
+      index: ctx.index,
+      toolName: ctx.toolName,
+      summary: ctx.llmSummary,
+      tokenCost: estimateTokens(ctx.result),
+    }));
+
+    // Ask LLM to select most relevant results
+    const selectionPrompt = buildContextSelectionPrompt(query, summaries);
+    const response = await callLlm(selectionPrompt, {
+      model: getFastModel(this.modelProvider, this.model),
+      systemPrompt: 'You are a data selection assistant. Return only valid JSON.',
+      signal: this.signal,
+    });
+
+    // Parse selected indices
+    const selectedIndices = new Set<number>(JSON.parse(String(response)));
+
+    // Build context with full data for selected, summaries for rest
+    let usedTokens = 0;
+    const fullResults: string[] = [];
+    const summaryResults: string[] = [];
+
+    for (const ctx of contexts) {
+      const isSelected = selectedIndices.has(ctx.index);
+      const tokenCost = estimateTokens(ctx.result);
+
+      if (isSelected && usedTokens + tokenCost <= TOKEN_BUDGET) {
+        fullResults.push(this.formatSingleContext(ctx, true));
+        usedTokens += tokenCost;
+      } else {
+        summaryResults.push(this.formatSingleContext(ctx, false));
+      }
+    }
+
+    return this.combineContextSections(fullResults, summaryResults);
+  }
+
+  /**
+   * Format all contexts with full data (used when within token budget).
+   */
+  private formatFullContexts(contexts: ToolContextWithSummary[]): string {
+    return contexts.map(ctx => this.formatSingleContext(ctx, true)).join('\n\n');
+  }
+
+  /**
+   * Format all contexts with summaries only (fallback when LLM selection fails).
+   */
+  private formatSummariesOnly(contexts: ToolContextWithSummary[]): string {
+    const formatted = contexts.map(ctx => this.formatSingleContext(ctx, false));
+    return '## Data Summaries\n\n' + formatted.join('\n\n');
+  }
+
+  /**
+   * Format a single context entry.
+   * @param useFull - If true, include full result data. If false, use LLM summary.
+   */
+  private formatSingleContext(ctx: ToolContextWithSummary, useFull: boolean): string {
+    const description = getToolDescription(ctx.toolName, ctx.args);
+    if (useFull) {
       try {
         return `### ${description}\n\`\`\`json\n${JSON.stringify(JSON.parse(ctx.result), null, 2)}\n\`\`\``;
       } catch {
         // If result is not valid JSON, return as-is
         return `### ${description}\n${ctx.result}`;
       }
-    }).join('\n\n');
+    } else {
+      return `### ${description}\n${ctx.llmSummary}`;
+    }
+  }
+
+  /**
+   * Combine full data and summary sections into final context string.
+   */
+  private combineContextSections(fullResults: string[], summaryResults: string[]): string {
+    let output = '';
+    if (fullResults.length > 0) {
+      output += '## Full Data\n\n' + fullResults.join('\n\n');
+    }
+    if (summaryResults.length > 0) {
+      if (output) output += '\n\n';
+      output += '## Summary Data\n\n' + summaryResults.join('\n\n');
+    }
+    return output;
   }
 }

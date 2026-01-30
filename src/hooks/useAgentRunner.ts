@@ -103,24 +103,16 @@ export function useAgentRunner(
         break;
         
       case 'answer_start':
-        setWorkingState({ status: 'answering' });
-        break;
-        
-      case 'answer_chunk':
-        // Hide "Writing response..." once text starts appearing
-        setWorkingState({ status: 'idle' });
-        updateLastHistoryItem(item => ({
-          answer: item.answer + event.text,
-        }));
+        setWorkingState({ status: 'answering', startTime: Date.now() });
         break;
         
       case 'done': {
         const doneEvent = event as DoneEvent;
         updateLastHistoryItem(item => {
-          // Add to message history for multi-turn context
-          if (item.query && doneEvent.answer) {
-            inMemoryChatHistoryRef.current?.addMessage(item.query, doneEvent.answer).catch(() => {
-              // Silently ignore errors in adding to history
+          // Update answer in chat history for multi-turn context
+          if (doneEvent.answer) {
+            inMemoryChatHistoryRef.current?.saveAnswer(doneEvent.answer).catch(() => {
+              // Silently ignore errors in updating history
             });
           }
           return {
@@ -155,6 +147,10 @@ export function useAgentRunner(
       status: 'processing',
       startTime,
     }]);
+    
+    // Save query to chat history immediately for multi-turn context
+    inMemoryChatHistoryRef.current?.saveUserQuery(query);
+    
     setError(null);
     setWorkingState({ status: 'thinking' });
     

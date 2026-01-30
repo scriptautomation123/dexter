@@ -1,4 +1,5 @@
 import { buildToolDescriptions } from '../tools/registry.js';
+import { buildSkillMetadataSection, discoverSkills } from '../skills/index.js';
 
 // ============================================================================
 // Helper Functions
@@ -15,6 +16,31 @@ export function getCurrentDate(): string {
     day: 'numeric',
   };
   return new Date().toLocaleDateString('en-US', options);
+}
+
+/**
+ * Build the skills section for the system prompt.
+ * Only includes skill metadata if skills are available.
+ */
+function buildSkillsSection(): string {
+  const skills = discoverSkills();
+  
+  if (skills.length === 0) {
+    return '';
+  }
+
+  const skillList = buildSkillMetadataSection();
+  
+  return `## Available Skills
+
+${skillList}
+
+## Skill Usage Policy
+
+- Check if available skills can help complete the task more effectively
+- When a skill is relevant, invoke it IMMEDIATELY as your first action
+- Skills provide specialized workflows for complex tasks (e.g., DCF valuation)
+- Do not invoke a skill that has already been invoked for the current query`;
 }
 
 // ============================================================================
@@ -40,26 +66,28 @@ Your output is displayed on a command line interface. Keep responses short and c
 
 - Keep responses brief and direct
 - For non-comparative information, prefer plain text or simple lists over tables
-- Do not use markdown text formatting (no **bold**, *italics*, headers) - use plain text, lists, and box-drawing tables
+- Do not use markdown headers or *italics* - use **bold** sparingly for emphasis
 
 ## Tables (for comparative/tabular data)
 
-Tables render in a terminal with limited width. Keep them compact and scannable.
+Use markdown tables. They will be rendered as formatted box tables.
 
-Structure:
-- Max 4-6 columns per table; prefer multiple small focused tables over one wide table
-- Single-entity data: use vertical layout (metrics as rows)
-- Multi-entity comparison: use horizontal layout (entities as columns)
-- One concept per table; don't mix unrelated metrics
+STRICT FORMAT - each row must:
+- Start with | and end with |
+- Have no trailing spaces after the final |
+- Use |---| separator (with optional : for alignment)
 
-Column headers and cell values must be short:
+| Ticker | Rev    | OM  |
+|--------|--------|-----|
+| AAPL   | 416.2B | 31% |
+
+Keep tables compact:
+- Max 2-3 columns; prefer multiple small tables over one wide table
+- Headers: 1-3 words max. "FY Rev" not "Most recent fiscal year revenue"
 - Tickers not names: "AAPL" not "Apple Inc."
-- Abbreviate metrics: Rev, Op Inc, Net Inc, OCF, FCF, GM, OM, EPS, Mkt Cap
-- Dates compact: "Q4 FY25" or "TTM" not "2025-09-27"
+- Abbreviate: Rev, Op Inc, Net Inc, OCF, FCF, GM, OM, EPS
 - Numbers compact: 102.5B not $102,466,000,000
-- Omit units in cells if header includes them: header "Rev ($B)" → cell "102.5"
-- Percentages: "31%" not "31.24%" unless precision matters
-- No redundant columns (don't repeat company name in every row if obvious from context)`;
+- Omit units in cells if header has them`;
 
 // ============================================================================
 // System Prompt
@@ -90,12 +118,16 @@ ${toolDescriptions}
 - Do NOT break up queries into multiple tool calls when one call can handle the request
 - If a query can be answered from general knowledge, respond directly without using tools
 
+${buildSkillsSection()}
+
 ## Behavior
 
 - Prioritize accuracy over validation - don't cheerfully agree with flawed assumptions
 - Use professional, objective tone without excessive praise or emotional validation
 - For research tasks, be thorough but efficient
 - Avoid over-engineering responses - match the scope of your answer to the question
+- Never ask users to provide raw data, paste values, or reference JSON/API internals - users ask questions, they don't have access to financial APIs
+- If data is incomplete, answer with what you have without exposing implementation details
 
 ## Response Format
 
@@ -103,26 +135,28 @@ ${toolDescriptions}
 - For research: lead with the key finding and include specific data points
 - For non-comparative information, prefer plain text or simple lists over tables
 - Don't narrate your actions or ask leading questions about what the user wants
-- Do not use markdown text formatting (no **bold**, *italics*, headers) - use plain text, lists, and box-drawing tables
+- Do not use markdown headers or *italics* - use **bold** sparingly for emphasis
 
 ## Tables (for comparative/tabular data)
 
-Tables render in a terminal with limited width. Keep them compact and scannable.
+Use markdown tables. They will be rendered as formatted box tables.
 
-Structure:
-- Max 4-6 columns per table; prefer multiple small focused tables over one wide table
-- Single-entity data: use vertical layout (metrics as rows)
-- Multi-entity comparison: use horizontal layout (entities as columns)
-- One concept per table; don't mix unrelated metrics
+STRICT FORMAT - each row must:
+- Start with | and end with |
+- Have no trailing spaces after the final |
+- Use |---| separator (with optional : for alignment)
 
-Column headers and cell values must be short:
+| Ticker | Rev    | OM  |
+|--------|--------|-----|
+| AAPL   | 416.2B | 31% |
+
+Keep tables compact:
+- Max 2-3 columns; prefer multiple small tables over one wide table
+- Headers: 1-3 words max. "FY Rev" not "Most recent fiscal year revenue"
 - Tickers not names: "AAPL" not "Apple Inc."
-- Abbreviate metrics: Rev, Op Inc, Net Inc, OCF, FCF, GM, OM, EPS, Mkt Cap
-- Dates compact: "Q4 FY25" or "TTM" not "2025-09-27"
+- Abbreviate: Rev, Op Inc, Net Inc, OCF, FCF, GM, OM, EPS
 - Numbers compact: 102.5B not $102,466,000,000
-- Omit units in cells if header includes them: header "Rev ($B)" → cell "102.5"
-- Percentages: "31%" not "31.24%" unless precision matters
-- No redundant columns (don't repeat company name in every row if obvious from context)`;
+- Omit units in cells if header has them`;
 }
 
 // ============================================================================
@@ -132,17 +166,31 @@ Column headers and cell values must be short:
 /**
  * Build user prompt for agent iteration with tool summaries (context compaction).
  * Uses lightweight summaries instead of full results to manage context window size.
+ * 
+ * @param originalQuery - The user's original query
+ * @param toolSummaries - Summaries of tool results so far
+ * @param toolUsageStatus - Optional tool usage status for graceful exit mechanism
  */
 export function buildIterationPrompt(
   originalQuery: string,
-  toolSummaries: string[]
+  toolSummaries: string[],
+  toolUsageStatus?: string | null
 ): string {
-  return `Query: ${originalQuery}
+  let prompt = `Query: ${originalQuery}
 
 Data retrieved and work completed so far:
-${toolSummaries.join('\n')}
+${toolSummaries.join('\n')}`;
+
+  // Add tool usage status if available (graceful exit mechanism)
+  if (toolUsageStatus) {
+    prompt += `\n\n${toolUsageStatus}`;
+  }
+
+  prompt += `
 
 Review the data above. If you have sufficient information to answer the query, respond directly WITHOUT calling any tools. Only call additional tools if there are specific data gaps that prevent you from answering.`;
+
+  return prompt;
 }
 
 // ============================================================================
@@ -159,10 +207,10 @@ export function buildFinalAnswerPrompt(
 ): string {
   return `Query: ${originalQuery}
 
-Data:
+Data retrieved from your tool calls:
 ${fullContextData}
 
-Answer proportionally - match depth to the question's complexity.`;
+Answer the user's query using this data. Do not ask the user to provide additional data, paste values, or reference JSON/API internals. If data is incomplete, answer with what you have.`;
 }
 
 // ============================================================================
@@ -189,4 +237,35 @@ ${result}
 
 Write a 1 sentence summary of what was retrieved. Include specific values (numbers, dates) if relevant.
 Format: "[tool_call] -> [what was learned]"`;
+}
+
+// ============================================================================
+// Context Selection (for token budget management)
+// ============================================================================
+
+/**
+ * Build prompt for LLM to select which tool results need full data.
+ * Used when total context exceeds token budget - LLM chooses most relevant results
+ * to include in full, with summaries for the rest.
+ */
+export function buildContextSelectionPrompt(
+  query: string,
+  summaries: Array<{ index: number; toolName: string; summary: string; tokenCost: number }>
+): string {
+  const summaryList = summaries
+    .map(s => `[${s.index}] ${s.toolName} (~${Math.round(s.tokenCost / 1000)}k tokens): ${s.summary}`)
+    .join('\n');
+
+  return `You are selecting which tool results are most important for answering a query.
+
+Query: ${query}
+
+Available tool results (with summaries):
+${summaryList}
+
+Select the tool results that contain data ESSENTIAL to answering the query accurately.
+Prefer results with specific numbers, dates, or facts directly relevant to the query.
+
+Return ONLY a JSON array of indices, e.g.: [0, 2, 5]
+Return an empty array [] if summaries alone are sufficient.`;
 }
