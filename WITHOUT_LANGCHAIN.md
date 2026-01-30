@@ -79,6 +79,13 @@ interface CallOptions {
 
 ## Step-by-Step Migration Guide
 
+> **Note:** The code examples below are conceptual implementations showing the structure and approach. In a production implementation, you would need to:
+> - Add proper error handling (try/catch blocks, JSON parsing validation)
+> - Include all necessary imports
+> - Add input validation and sanitization
+> - Implement comprehensive logging
+> - Add unit tests
+
 ### Step 1: Install Provider SDKs
 
 ```bash
@@ -171,11 +178,22 @@ export class OpenAIProvider {
     
     return {
       content: message.content || '',
-      toolCalls: message.tool_calls?.map(tc => ({
-        id: tc.id,
-        name: tc.function.name,
-        arguments: JSON.parse(tc.function.arguments),
-      })),
+      toolCalls: message.tool_calls?.map(tc => {
+        try {
+          return {
+            id: tc.id,
+            name: tc.function.name,
+            arguments: JSON.parse(tc.function.arguments),
+          };
+        } catch (e) {
+          console.error('Failed to parse tool call arguments:', e);
+          return {
+            id: tc.id,
+            name: tc.function.name,
+            arguments: {},
+          };
+        }
+      }),
     };
   }
   
@@ -220,7 +238,7 @@ export class OpenAIProvider {
 // src/model/providers/anthropic.ts
 
 import Anthropic from '@anthropic-ai/sdk';
-import type { Message, Tool, AIMessage, ModelConfig } from '../types.js';
+import type { Message, Tool, AIMessage, ToolCall, ModelConfig } from '../types.js';
 
 export class AnthropicProvider {
   private client: Anthropic;
@@ -668,7 +686,10 @@ export function createTool(definition: ToolDefinition): ToolDefinition {
 ```typescript
 // src/tools/finance/prices.ts (without LangChain)
 
-import { createTool } from '../types.js';
+import { createTool, type ToolDefinition } from '../types.js';
+// Note: callApi and formatToolResult are existing utility functions in Dexter
+import { callApi } from './api.js';
+import { formatToolResult } from '../types.js';
 
 export const getPriceSnapshot = createTool({
   name: 'get_price_snapshot',
@@ -744,14 +765,19 @@ export const getPrices = createTool({
 
 import { ChatModel, callLlm, streamLlm } from '../model/llm.js';
 import type { Message, Tool, AIMessage } from '../model/types.js';
+import type { ToolDefinition } from '../tools/types.js';
+import type { AgentConfig } from './types.js';
+import { getTools } from '../tools/registry.js';
 
 export class Agent {
   private model: ChatModel;
   private tools: Map<string, ToolDefinition>;
+  private signal?: AbortSignal;
   
   constructor(config: AgentConfig) {
     this.model = new ChatModel(config.model || 'gpt-5.2');
     this.tools = new Map(getTools().map(t => [t.name, t]));
+    this.signal = config.signal;
   }
   
   private async callModel(messages: Message[]): Promise<AIMessage> {
@@ -906,8 +932,12 @@ const response = await client.chat.completions.create({
 
 const toolCall = response.choices[0].message.tool_calls?.[0];
 if (toolCall) {
-  const args = JSON.parse(toolCall.function.arguments);
-  const result = `The weather in ${args.location} is sunny`;
+  try {
+    const args = JSON.parse(toolCall.function.arguments);
+    const result = `The weather in ${args.location} is sunny`;
+  } catch (e) {
+    console.error('Failed to parse tool arguments:', e);
+  }
 }
 ```
 
