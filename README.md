@@ -97,6 +97,7 @@ bun dev
 - **[ARCHITECTURE.md](./ARCHITECTURE.md)** - Comprehensive architecture documentation explaining how Dexter works internally, including how it decides when to continue vs complete
 - **[CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md)** - Step-by-step walkthrough of a real query execution with annotated code
 - **[QUICK_REFERENCE.md](./QUICK_REFERENCE.md)** - Quick reference guide for developers with code examples and common tasks
+- **[INK_EXAMPLES.md](./INK_EXAMPLES.md)** - React-based CLI guide showing how Ink is used from simple to complex examples
 
 ### Key Concept: Loop Completion Logic
 
