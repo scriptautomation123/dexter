@@ -97,6 +97,46 @@ export function Intro({ provider, model }) {
 - `color`, `bold` - Text styling
 - Dynamic content via props (`{model}`)
 
+### 1.2.1 Theme Configuration for Consistent Styling
+
+Dexter uses a centralized theme for consistent colors and dimensions:
+
+```typescript
+// src/theme.ts
+export const colors = {
+  primary: '#58A6FF',       // GitHub blue
+  primaryLight: '#a5cfff',
+  success: 'green',
+  error: 'red',
+  warning: 'yellow',
+  muted: '#808080',         // Gray
+  mutedDark: '#303030',     // Dark gray
+  accent: 'cyan',
+  highlight: 'magenta',
+  white: '#ffffff',
+  info: '#6CB6FF',
+  queryBg: '#3D3D3D',
+  claude: '#E5896A',
+} as const;
+
+export const dimensions = {
+  boxWidth: 80,
+  introWidth: 50,
+} as const;
+
+// Usage in components:
+import { colors, dimensions } from '../theme.js';
+
+<Text color={colors.primary}>Styled text</Text>
+<Box width={dimensions.boxWidth}>Content</Box>
+```
+
+**Key Concepts:**
+- **Centralized theme** - Consistent colors across all components
+- **Hex colors** - Terminal support for 24-bit color
+- **Type safety** - `as const` for TypeScript autocomplete
+- **Easy theming** - Change colors in one place
+
 ### 1.3 Animated Components with Spinner
 
 ```typescript
@@ -246,88 +286,156 @@ export function Input({ onSubmit, historyValue, onHistoryNavigate }) {
 
 ### 2.3 Custom Cursor Display
 
+Dexter uses **chalk** for ANSI escape codes to ensure proper text wrapping:
+
 ```typescript
 // src/components/CursorText.tsx
 import React from 'react';
 import { Text } from 'ink';
+import chalk from 'chalk';
 
 export function CursorText({ text, cursorPosition }) {
-  const beforeCursor = text.substring(0, cursorPosition);
-  const atCursor = text[cursorPosition] || ' ';
-  const afterCursor = text.substring(cursorPosition + 1);
+  const beforeCursor = text.slice(0, cursorPosition);
+  const atCursor = cursorPosition < text.length ? text[cursorPosition] : ' ';
+  const afterCursor = text.slice(cursorPosition + 1);
 
-  return (
-    <Text>
-      {beforeCursor}
-      <Text inverse>{atCursor}</Text>
-      {afterCursor}
-    </Text>
-  );
+  // Build a single string with ANSI escape codes for the cursor
+  // This ensures text wraps correctly across terminal lines
+  const displayText = beforeCursor + chalk.inverse(atCursor) + afterCursor;
+
+  return <Text>{displayText}</Text>;
 }
 ```
 
 **Key Concepts:**
-- `inverse` - Inverts colors (creates cursor effect)
-- String slicing to position cursor
-- Render cursor at any position in text
+- `chalk.inverse()` - ANSI escape codes for proper text rendering
+- Single `<Text>` element ensures correct wrapping across terminal lines
+- Works better than nested `<Text inverse>` for long input
+- String slicing to position cursor at any location
 
 ---
 
 ## Level 3: State Management with Hooks
 
-### 3.1 Custom Hook for Text Buffer
+### 3.1 Custom Hook for Text Buffer - Production Implementation
 
-Dexter uses custom hooks to manage complex state:
+Dexter uses **refs instead of state** to avoid race conditions with fast typing:
 
 ```typescript
-// src/hooks/useTextBuffer.ts (simplified)
-import { useState, useCallback } from 'react';
+// src/hooks/useTextBuffer.ts (actual production code)
+import { useRef, useState, useCallback } from 'react';
 
 export function useTextBuffer() {
-  const [text, setText] = useState('');
-  const [cursorPosition, setCursorPosition] = useState(0);
+  // Use refs to avoid race conditions with fast typing
+  const buffer = useRef('');
+  const cursorPos = useRef(0);
+  const [, forceRender] = useState(0);
+
+  const rerender = useCallback(() => forceRender(x => x + 1), []);
 
   const actions = {
-    insert: useCallback((char: string) => {
-      setText(prev => 
-        prev.slice(0, cursorPosition) + char + prev.slice(cursorPosition)
-      );
-      setCursorPosition(prev => prev + 1);
-    }, [cursorPosition]),
+    insert: (input: string) => {
+      // Normalize newlines and carriage returns to spaces for single-line input
+      const normalized = input.replace(/[\r\n]+/g, ' ');
+      buffer.current =
+        buffer.current.slice(0, cursorPos.current) +
+        normalized +
+        buffer.current.slice(cursorPos.current);
+      cursorPos.current += normalized.length;
+      rerender();
+    },
 
-    deleteBackward: useCallback(() => {
-      if (cursorPosition > 0) {
-        setText(prev => 
-          prev.slice(0, cursorPosition - 1) + prev.slice(cursorPosition)
-        );
-        setCursorPosition(prev => prev - 1);
+    deleteBackward: () => {
+      if (cursorPos.current > 0) {
+        buffer.current =
+          buffer.current.slice(0, cursorPos.current - 1) +
+          buffer.current.slice(cursorPos.current);
+        cursorPos.current--;
+        rerender();
       }
-    }, [cursorPosition]),
+    },
 
-    moveCursor: useCallback((newPos: number) => {
-      setCursorPosition(Math.max(0, Math.min(newPos, text.length)));
-    }, [text.length]),
+    moveCursor: (position: number) => {
+      cursorPos.current = Math.max(0, Math.min(buffer.current.length, position));
+      rerender();
+    },
 
-    clear: useCallback(() => {
-      setText('');
-      setCursorPosition(0);
-    }, []),
+    clear: () => {
+      buffer.current = '';
+      cursorPos.current = 0;
+      rerender();
+    },
 
-    setValue: useCallback((newText: string) => {
-      setText(newText);
-      setCursorPosition(newText.length);
-    }, []),
+    setValue: (value: string, cursorAtEnd = true) => {
+      buffer.current = value;
+      cursorPos.current = cursorAtEnd ? value.length : 0;
+      rerender();
+    },
   };
 
-  return { text, cursorPosition, actions };
+  return {
+    text: buffer.current,
+    cursorPosition: cursorPos.current,
+    actions,
+  };
 }
 ```
 
+**Key Concepts (Production Critical!):**
+- **`useRef` instead of `useState`** - Prevents race conditions with rapid typing
+  - With `useState`, fast typing could cause stale closures
+  - Refs always have the current value
+- **Manual re-renders** - Only trigger renders when needed via `forceRender`
+- **Input normalization** - Convert newlines to spaces for single-line input
+- **Immutable string operations** - Safe even with refs
+- Return actions as stable API
+
+**Why This Matters:** In a simple example, `useState` works fine. But for production CLIs with fast user input, refs prevent bugs where character order gets scrambled due to async state updates.
+
+### 3.1.2 Helper Functions for Cursor Navigation
+
+Dexter extracts cursor logic into pure functions for testability:
+
+```typescript
+// src/utils/input-key-handlers.ts
+export interface CursorContext {
+  text: string;
+  cursorPosition: number;
+}
+
+export const cursorHandlers = {
+  /** Move cursor one character left */
+  moveLeft: (ctx: CursorContext): number =>
+    Math.max(0, ctx.cursorPosition - 1),
+
+  /** Move cursor one character right */
+  moveRight: (ctx: CursorContext): number =>
+    Math.min(ctx.text.length, ctx.cursorPosition + 1),
+
+  /** Move cursor to start of line */
+  moveToStart: (): number => 0,
+
+  /** Move cursor to end of line */
+  moveToEnd: (ctx: CursorContext): number => ctx.text.length,
+
+  /** Move cursor to start of previous word */
+  moveWordBackward: (ctx: CursorContext): number =>
+    findPrevWordStart(ctx.text, ctx.cursorPosition),
+
+  /** Move cursor to end of next word */
+  moveWordForward: (ctx: CursorContext): number =>
+    findNextWordEnd(ctx.text, ctx.cursorPosition),
+};
+
+// Usage in Input component:
+const ctx = { text, cursorPosition };
+actions.moveCursor(cursorHandlers.moveLeft(ctx));
+```
+
 **Key Concepts:**
-- Custom hooks encapsulate complex logic
-- `useCallback` optimizes performance
-- Immutable state updates
-- Return actions as API
+- **Pure functions** - Easier to test and reason about
+- **Separation of concerns** - Input component handles events, helpers compute positions
+- **Context pattern** - Pass current state as context object
 
 ### 3.2 State Management for Agent Execution
 
@@ -846,12 +954,150 @@ export function CLI() {
 
 ---
 
+## Production Tips: Lessons from Dexter
+
+### 🔧 Performance Optimizations
+
+#### 1. Use Refs for Fast Input
+**Problem:** `useState` can cause race conditions with rapid keyboard input.
+**Solution:** Use `useRef` for buffer management, trigger renders manually.
+
+```typescript
+// ❌ Bad - Race conditions possible
+const [text, setText] = useState('');
+const handleInput = (char) => setText(prev => prev + char);
+
+// ✅ Good - No race conditions
+const buffer = useRef('');
+const [, forceRender] = useState(0);
+const handleInput = (char) => {
+  buffer.current += char;
+  forceRender(x => x + 1);
+};
+```
+
+#### 2. ANSI Escaping for Text Wrapping
+**Problem:** Nested `<Text>` components can break terminal wrapping.
+**Solution:** Use chalk to build a single string with ANSI codes.
+
+```typescript
+// ❌ May break wrapping
+<Text>
+  {before}<Text inverse>{cursor}</Text>{after}
+</Text>
+
+// ✅ Ensures proper wrapping
+import chalk from 'chalk';
+const display = before + chalk.inverse(cursor) + after;
+<Text>{display}</Text>
+```
+
+#### 3. Extract Pure Functions for Testability
+**Problem:** Complex logic inside components is hard to test.
+**Solution:** Extract pure functions into separate modules.
+
+```typescript
+// ✅ Easy to test
+export const cursorHandlers = {
+  moveLeft: (ctx) => Math.max(0, ctx.cursorPosition - 1),
+  moveRight: (ctx) => Math.min(ctx.text.length, ctx.cursorPosition + 1),
+};
+
+// Use in component
+actions.moveCursor(cursorHandlers.moveLeft({ text, cursorPosition }));
+```
+
+### 🎨 UI/UX Best Practices
+
+#### 1. Centralize Theme Configuration
+Create a theme file for consistent colors:
+
+```typescript
+// theme.ts
+export const colors = {
+  primary: '#58A6FF',
+  error: 'red',
+  muted: '#808080',
+} as const;
+
+// Use everywhere
+import { colors } from './theme.js';
+<Text color={colors.primary}>Styled</Text>
+```
+
+#### 2. Provide Clear Feedback
+Always show status during long operations:
+
+```typescript
+{isProcessing && <WorkingIndicator state={workingState} />}
+```
+
+#### 3. Support Cancellation
+Long-running operations should be cancellable:
+
+```typescript
+useInput((input, key) => {
+  if (key.escape && isProcessing) {
+    cancelExecution();
+  }
+});
+```
+
+### 🐛 Error Handling
+
+#### 1. Distinguish Abort from Real Errors
+```typescript
+try {
+  await runTask();
+} catch (err) {
+  if (err.name === 'AbortError') {
+    setError('Cancelled by user');
+  } else {
+    setError(`Failed: ${err.message}`);
+  }
+}
+```
+
+#### 2. Show Errors Clearly
+```typescript
+{error && (
+  <Box marginBottom={1}>
+    <Text color="red">Error: {error}</Text>
+  </Box>
+)}
+```
+
+### 🔍 Debugging Tips
+
+#### 1. Use Debug Panel (Development Only)
+Dexter includes a debug panel that doesn't interfere with main UI:
+
+```typescript
+<DebugPanel show={process.env.NODE_ENV === 'development'} maxLines={8} />
+```
+
+#### 2. Log to stderr During Development
+```typescript
+// Won't corrupt Ink display
+console.error('Debug info:', data);
+```
+
+#### 3. Test with Different Terminal Sizes
+```typescript
+// Responsive sizing
+<Box width="100%">  // Full width
+<Box minWidth={40}>  // Minimum width
+```
+
+---
+
 ## Resources
 
 - **Ink Documentation**: https://github.com/vadimdemedes/ink
 - **Dexter Architecture**: [ARCHITECTURE.md](./ARCHITECTURE.md)
 - **Code Walkthrough**: [CODE_WALKTHROUGH.md](./CODE_WALKTHROUGH.md)
 - **Ink Component Gallery**: https://github.com/vadimdemedes/ink#useful-components
+- **Chalk (ANSI styling)**: https://github.com/chalk/chalk
 
 ---
 
@@ -865,5 +1111,6 @@ To build your own React-based CLI:
 4. **Add Effects**: Use `useEffect` for side effects
 5. **Compose**: Build complex UIs from small components
 6. **Polish**: Add colors, spacing, animations
+7. **Optimize**: Use refs for performance, chalk for rendering
 
 Happy building! 🚀
